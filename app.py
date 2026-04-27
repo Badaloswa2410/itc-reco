@@ -25,10 +25,23 @@ st.set_page_config(
 # PASSWORD / LOGIN
 # =============================================================================
 
-VALID_CREDENTIALS = {
-    "badal"  : "itcreco@2025",
-    "admin"  : "admin@reco",
-}
+# Passwords are stored securely in Streamlit Secrets (not in this code).
+# On Streamlit Cloud: go to App Settings → Secrets and add:
+#
+#   [credentials]
+#   badal = "itcreco@2025"
+#   youruser = "yourpassword"
+#
+# For local testing: create .streamlit/secrets.toml with the same content.
+# If secrets are not configured yet, falls back to a safe error message.
+
+def get_credentials():
+    try:
+        return dict(st.secrets["credentials"])
+    except Exception:
+        return {}
+
+VALID_CREDENTIALS = get_credentials()
 
 def check_login():
     if "logged_in" not in st.session_state:
@@ -50,7 +63,9 @@ def check_login():
                 password = st.text_input("Password", type="password")
                 submitted = st.form_submit_button("Login", use_container_width=True)
                 if submitted:
-                    if username in VALID_CREDENTIALS and VALID_CREDENTIALS[username] == password:
+                    if not VALID_CREDENTIALS:
+                        st.error("⚠️ Credentials not configured. Please add secrets in Streamlit Cloud settings.")
+                    elif username in VALID_CREDENTIALS and VALID_CREDENTIALS[username] == password:
                         st.session_state.logged_in = True
                         st.session_state.username  = username
                         st.rerun()
