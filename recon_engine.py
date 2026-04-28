@@ -398,64 +398,60 @@ VARIANCE_LABELS = {M_FI,M_1,M_5,M_FI_1,M_FI_5,CB_FI,VN_FI,VN_1,VN_5,PAN_1,PAN_5,
 def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label="Phase 1",log_fn=print,progress_fn=None):
     log_fn(f"\n  [{label}] One-to-One..."
            + (" (exact)" if exact_only else " (variance)" if variance_only else ""))
+
     pr_um = pr[~pr.index.isin(mpr)]
+    TAX_RATIO_LIMIT = 10.0
 
-    # ── Optimisation 2: Pre-group PR rows by Financial Year ───────────────────
-    # We only ever compare rows within the same FY (DFY is the only cross-FY
-    # case and is handled separately). Pre-grouping avoids FY checks inside
-    # the hot loop.
-    pr_by_fy = {}
-    for j, rpr in pr_um.iterrows():
-        pr_by_fy.setdefault(rpr["_fy"], []).append(j)
+    # ── FAST PATH: Vectorized exact match (L1 = "Matched") ───────────────────
+    # Uses pandas merge — O(n log n) instead of O(n×m).
+    # Only runs in exact_only mode and covers the most common case.
+    if exact_only and not variance_only:
+        g2b = gstr2b[~gstr2b.index.isin(m2b)].copy()
+        g2b["_src"] = "2b"
+        gpr = pr_um.copy()
+        gpr["_src"] = "pr"
 
-    # ── Buckets 1-3 (Bucket 4 removed — moved to Phase 4) ────────────────────
-    # Bucket 1: GSTIN          → all GSTIN-match cases
-    # Bucket 2: PAN            → PAN-match, GSTIN differs
-    # Bucket 3: Invoice norm   → vendor-name match (invoice must align)
-    # Bucket 4 removal: suffix/prefix with full GSTIN+PAN mismatch is now
-    # flagged in Phase 4 only — safer (uncertain match) and much faster.
+        merge_keys = ["gstin","_inv_norm","_fy","igst","cgst","sgst"]
+        merged = g2b[merge_keys + ["_src"]].reset_index().merge(
+            gpr[merge_keys + ["_src"]].reset_index(),
+            on=merge_keys, suffixes=("_2b","_pr")
+        )
+        # Remove self-duplicates and assign greedily
+        used_2b, used_pr = set(), set()
+        for _, row in merged.iterrows():
+            i, j = int(row["index_2b"]), int(row["index_pr"])
+            if i in used_2b or j in used_pr or i in m2b or j in mpr:
+                continue
+            mark_1to1(i, j, M, gstr2b, pr, m2b, mpr)
+            used_2b.add(i); used_pr.add(j)
+
+        matched_fast = len(used_2b)
+        log_fn(f"    -> {matched_fast} exact matches (fast path).")
+        if progress_fn:
+            progress_fn(label, len(gstr2b), len(gstr2b))
+
+        # Refresh pr_um after fast-path matches
+        pr_um = pr[~pr.index.isin(mpr)]
+
+    # ── SLOW PATH: Loop-based for fuzzy/variance/PAN/vendor-name/suffix ───────
+    # Buckets 1-3 only (no Bucket 4 full scan — moved to Phase 4)
     bg, bp, bi = {}, {}, {}
     for j, rpr in pr_um.iterrows():
         bg.setdefault(rpr["gstin"], []).append(j)
-        if rpr["_pan"]:
-            bp.setdefault(rpr["_pan"], []).append(j)
-        if rpr["_inv_norm"]:
-            bi.setdefault(rpr["_inv_norm"], []).append(j)
-
-    # ── Optimisation 3: Tax pre-filter threshold ──────────────────────────────
-    # If total tax of the two rows differs by more than 10x, they can never
-    # match under any of our rules (max variance is 5%). Skip classify_pair
-    # entirely. This avoids expensive fuzzy comparisons on clearly wrong pairs.
-    TAX_RATIO_LIMIT = 10.0
-
-    def tax_plausible(tax_a, tax_b):
-        """Returns True if taxes are close enough to bother comparing."""
-        if tax_a == 0 and tax_b == 0:
-            return True
-        if tax_a == 0 or tax_b == 0:
-            return False
-        ratio = max(tax_a, tax_b) / min(tax_a, tax_b)
-        return ratio <= TAX_RATIO_LIMIT
+        if rpr["_pan"]:      bp.setdefault(rpr["_pan"], []).append(j)
+        if rpr["_inv_norm"]: bi.setdefault(rpr["_inv_norm"], []).append(j)
 
     def cands(r2b):
-        """
-        Returns candidate PR indices for a given 2B row.
-        Uses buckets 1-3 only. No full O(n×m) scan.
-        """
         seen, res = set(), []
-        # Bucket 1: same GSTIN
         for j in bg.get(r2b["gstin"], []):
-            if j not in seen:
-                seen.add(j); res.append(j)
-        # Bucket 2: same PAN, GSTIN differs
+            if j not in seen: seen.add(j); res.append(j)
         if r2b["_pan"]:
             for j in bp.get(r2b["_pan"], []):
-                if pr_um.loc[j, "gstin"] != r2b["gstin"] and j not in seen:
+                if pr_um.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
                     seen.add(j); res.append(j)
-        # Bucket 3: same invoice norm, GSTIN differs (vendor name cases)
         if r2b["_inv_norm"]:
             for j in bi.get(r2b["_inv_norm"], []):
-                if pr_um.loc[j, "gstin"] != r2b["gstin"] and j not in seen:
+                if pr_um.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
                     seen.add(j); res.append(j)
         return res
 
@@ -478,24 +474,22 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
                 continue
             rpr = pr_um.loc[j]
 
-            # ── Optimisation 2: FY check using pre-group ──────────────────
-            # Allow same FY or DFY (cross FY exact match) — skip everything else
-            rpr_fy = rpr["_fy"]
-            if rpr_fy != r2b_fy:
-                # Only worth checking for DFY: needs exact invoice + exact tax
-                if rpr["_inv_norm"] != r2b["_inv_norm"]:
+            # FY check — allow same FY or cross-FY only if invoice also matches
+            if rpr["_fy"] != r2b_fy and rpr["_inv_norm"] != r2b["_inv_norm"]:
+                continue
+
+            # Tax pre-filter — skip wildly different tax values
+            rpr_tax = rpr["_total_tax"]
+            if r2b_tax > 0 and rpr_tax > 0:
+                if max(r2b_tax, rpr_tax) / min(r2b_tax, rpr_tax) > TAX_RATIO_LIMIT:
                     continue
 
-            # ── Optimisation 3: Tax pre-filter ────────────────────────────
-            if not tax_plausible(r2b_tax, rpr["_total_tax"]):
-                continue
-
             res = classify_pair(r2b, rpr, cfg)
-            if res is None:
-                continue
+            if res is None: continue
             p, lbl, ir = res
-            if not ir:
-                continue
+            if not ir: continue
+            # Skip L1 (M) — already handled by fast path
+            if lbl == M: continue
             if exact_only    and lbl in VARIANCE_LABELS: continue
             if variance_only and lbl not in VARIANCE_LABELS: continue
             pairs.append((p, i, j, lbl))
@@ -506,11 +500,14 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
     pairs.sort(key=lambda x: x[0])
     lc = {}
     for p, i, j, lbl in pairs:
-        if i in m2b or j in mpr:
-            continue
+        if i in m2b or j in mpr: continue
         mark_1to1(i, j, lbl, gstr2b, pr, m2b, mpr)
         lc[lbl] = lc.get(lbl, 0) + 1
-    log_fn(f"    -> {sum(lc.values())} matched.")
+
+    if lc:
+        log_fn(f"    -> {sum(lc.values())} additional matched (complex path).")
+    else:
+        log_fn(f"    -> 0 additional (complex path).")
 
 
 def _find_groups(one_row,other_df,cfg):
@@ -629,83 +626,114 @@ def phase3_partial_otm(gstr2b,pr,m2b,mpr,cfg,log_fn=print):
 
 def phase4_flags(gstr2b,pr,m2b,mpr,cfg,flagged_otm,log_fn=print):
     """
-    Phase 4 — Flags suspicious near-matches for manual review.
-    Also handles Bucket 4 (full O(n×m) scan on remaining rows) which was
-    removed from Phase 1 for performance. By Phase 4 the unmatched pool is
-    small so the full scan is fast.
+    Phase 4 — Flags suspicious near-matches + Bucket 4 edge cases.
+    Uses same bucket structure as Phase 1 — no full O(n×m) scan.
     """
     log_fn(f"\n  [Phase 4] Flagging and edge-case scan...")
     f2b, fpr, count = set(), set(), 0
-
-    # ── One-to-one flags + Bucket 4 edge cases ───────────────────────────────
-    # We scan all remaining unmatched pairs. classify_pair returns:
-    #   is_real=True  → confirmed match missed by buckets 1-3 (e.g. suffix/prefix
-    #                   with full GSTIN+PAN+name mismatch) → mark as confirmed
-    #   is_real=False → flag for manual review
     TAX_RATIO_LIMIT = 10.0
+
+    pr_um = pr[~pr.index.isin(mpr)]
+
+    # Build buckets for remaining unmatched PR rows
+    bg, bp, bi = {}, {}, {}
+    for j, rpr in pr_um.iterrows():
+        bg.setdefault(rpr["gstin"], []).append(j)
+        if rpr["_pan"]:      bp.setdefault(rpr["_pan"], []).append(j)
+        if rpr["_inv_norm"]: bi.setdefault(rpr["_inv_norm"], []).append(j)
+
+    # Also build a suffix-prefix index: map each PR inv_norm to its index
+    # for detecting prefix/suffix with full GSTIN+PAN mismatch (Bucket 4)
+    pr_inv_list = [(j, rpr["_inv_norm"], rpr["_total_tax"], rpr["gstin"])
+                   for j, rpr in pr_um.iterrows() if rpr["_inv_norm"]]
+
+    def cands_phase4(r2b):
+        """
+        Buckets 1-3 + Bucket 4 (suffix/prefix only, limited to short list).
+        """
+        seen, res = set(), []
+        # Bucket 1
+        for j in bg.get(r2b["gstin"], []):
+            if j not in seen: seen.add(j); res.append(j)
+        # Bucket 2
+        if r2b["_pan"]:
+            for j in bp.get(r2b["_pan"], []):
+                if pr_um.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
+                    seen.add(j); res.append(j)
+        # Bucket 3
+        if r2b["_inv_norm"]:
+            for j in bi.get(r2b["_inv_norm"], []):
+                if pr_um.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
+                    seen.add(j); res.append(j)
+        # Bucket 4: suffix/prefix candidates (GSTIN+PAN both miss)
+        # Only check if r2b invoice is long enough to have a prefix
+        if len(r2b["_inv_norm"]) >= 3:
+            for j, inv, tax, gstin in pr_inv_list:
+                if j in seen: continue
+                if gstin == r2b["gstin"]: continue  # already in Bucket 1
+                # Tax pre-filter
+                if r2b["_total_tax"] > 0 and tax > 0:
+                    if max(r2b["_total_tax"], tax) / min(r2b["_total_tax"], tax) > TAX_RATIO_LIMIT:
+                        continue
+                if is_suffix_prefix_match(r2b["_inv_norm"], inv):
+                    seen.add(j); res.append(j)
+        return res
 
     for i, r2b in gstr2b.iterrows():
         if i in m2b or i in f2b:
             continue
         r2b_tax = r2b["_total_tax"]
-        best_real = None   # (priority, j, label) — confirmed late match
-        best_flag = None   # (priority, j, label) — flag
+        best_real = None
+        best_flag = None
 
-        for j, rpr in pr[~pr.index.isin(mpr | fpr)].iterrows():
+        for j in cands_phase4(r2b):
+            if j in mpr or j in fpr or j not in pr_um.index:
+                continue
+            rpr = pr_um.loc[j]
             # Tax pre-filter
-            if r2b_tax > 0 and rpr["_total_tax"] > 0:
-                ratio = max(r2b_tax, rpr["_total_tax"]) / min(r2b_tax, rpr["_total_tax"])
-                if ratio > TAX_RATIO_LIMIT:
+            rpr_tax = rpr["_total_tax"]
+            if r2b_tax > 0 and rpr_tax > 0:
+                if max(r2b_tax, rpr_tax) / min(r2b_tax, rpr_tax) > TAX_RATIO_LIMIT:
                     continue
             res = classify_pair(r2b, rpr, cfg)
-            if res is None:
-                continue
+            if res is None: continue
             p, lbl, ir = res
             if ir:
-                if best_real is None or p < best_real[0]:
-                    best_real = (p, j, lbl)
+                if best_real is None or p < best_real[0]: best_real = (p, j, lbl)
             else:
-                if best_flag is None or p < best_flag[0]:
-                    best_flag = (p, j, lbl)
+                if best_flag is None or p < best_flag[0]: best_flag = (p, j, lbl)
 
         if best_real:
-            # Confirmed match found in Phase 4 (Bucket 4 edge case)
             _, j, lbl = best_real
             mark_1to1(i, j, lbl, gstr2b, pr, m2b, mpr)
             count += 1
         elif best_flag:
             _, j, lbl = best_flag
-            gstr2b.at[i, "Match Status"] = lbl
-            gstr2b.at[i, "_matched_idx"] = j
-            pr.at[j,     "Match Status"] = lbl
-            pr.at[j,     "_matched_idx"] = i
+            gstr2b.at[i,"Match Status"] = lbl; gstr2b.at[i,"_matched_idx"] = j
+            pr.at[j,"Match Status"]     = lbl; pr.at[j,"_matched_idx"]     = i
             f2b.add(i); fpr.add(j); count += 1
 
-    # ── One-to-many flags from Phase 2 ───────────────────────────────────────
+    # OTM flags from Phase 2
     for direction, anchor, others, lbl in flagged_otm:
         if direction == "2b_to_pr":
             i  = anchor
             js = [j for j in others if j not in mpr and j not in fpr]
             if i in m2b or i in f2b or not js: continue
-            gstr2b.at[i, "Match Status"]      = lbl
-            gstr2b.at[i, "_matched_idx_list"] = js
+            gstr2b.at[i,"Match Status"]      = lbl
+            gstr2b.at[i,"_matched_idx_list"] = js
             f2b.add(i)
             for j in js:
-                pr.at[j, "Match Status"] = lbl
-                pr.at[j, "_matched_idx"] = i
-                fpr.add(j)
+                pr.at[j,"Match Status"] = lbl; pr.at[j,"_matched_idx"] = i; fpr.add(j)
             count += 1
         else:
             j   = anchor
             is_ = [i for i in others if i not in m2b and i not in f2b]
             if j in mpr or j in fpr or not is_: continue
-            pr.at[j,     "Match Status"]      = lbl
-            pr.at[j,     "_matched_idx_list"] = is_
+            pr.at[j,"Match Status"]      = lbl
+            pr.at[j,"_matched_idx_list"] = is_
             fpr.add(j)
             for i in is_:
-                gstr2b.at[i, "Match Status"] = lbl
-                gstr2b.at[i, "_matched_idx"] = j
-                f2b.add(i)
+                gstr2b.at[i,"Match Status"] = lbl; gstr2b.at[i,"_matched_idx"] = j; f2b.add(i)
             count += 1
 
     log_fn(f"    -> {count} matched/flagged.")
