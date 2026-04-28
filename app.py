@@ -145,14 +145,15 @@ with col_t1:
     st.markdown("#### 📥 Download Input Template")
     st.caption("Use this template to prepare your data. Fill in the 2B and PR sheets and upload below.")
 with col_t2:
-    template_bytes = engine.create_template()
-    st.download_button(
-        label="⬇️ Download Template",
-        data=template_bytes,
-        file_name="Raw Data Template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    if st.button("⬇️ Download Template", use_container_width=True):
+        template_bytes = engine.create_template()
+        st.download_button(
+            label="📥 Click here to download",
+            data=template_bytes,
+            file_name="Raw Data Template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
 st.markdown("---")
 
