@@ -510,69 +510,189 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
         log_fn(f"    -> 0 additional (complex path).")
 
 
-def _find_groups(one_row,other_df,cfg):
-    FI,VN_T=cfg["fuzzy_inv_threshold"],cfg["vendor_name_threshold"]
-    pool=other_df[other_df["_fy"]==one_row["_fy"]]; gs=[]
-    g=pool[(pool["gstin"]==one_row["gstin"])&(pool["_inv_norm"]==one_row["_inv_norm"])&(pool["_inv_norm"]!="")]
-    if len(g)>=2: gs.append(g)
-    g=pool[(pool["gstin"]==one_row["gstin"])&(pool["_inv_norm"]!=one_row["_inv_norm"])&
-           pool["_inv_aggr"].apply(lambda x:fuzz.ratio(one_row["_inv_aggr"],x)>=FI)]
-    if len(g)>=2: gs.append(g)
-    g=pool[(pool["gstin"]==one_row["gstin"])&(pool["_inv_norm"]!=one_row["_inv_norm"])&
-           pool["_inv_norm"].apply(lambda x:is_suffix_prefix_match(one_row["_inv_norm"],x))]
-    if len(g)>=2: gs.append(g)
-    g=pool[(pool["gstin"]!=one_row["gstin"])&(pool["_inv_norm"]==one_row["_inv_norm"])&(pool["_inv_norm"]!="")&
-           pool["_name_norm"].apply(lambda x:fuzz.token_sort_ratio(one_row["_name_norm"],x)>=VN_T)]
-    if len(g)>=2: gs.append(g)
-    g=pool[(pool["gstin"]!=one_row["gstin"])&
-           pool["_name_norm"].apply(lambda x:fuzz.token_sort_ratio(one_row["_name_norm"],x)>=VN_T)&
-           pool["_inv_aggr"].apply(lambda x:fuzz.ratio(one_row["_inv_aggr"],x)>=FI)]
-    if len(g)>=2: gs.append(g)
-    g=pool[(pool["gstin"]!=one_row["gstin"])&
-           pool["_name_norm"].apply(lambda x:fuzz.token_sort_ratio(one_row["_name_norm"],x)>=VN_T)&
-           pool["_inv_norm"].apply(lambda x:is_suffix_prefix_match(one_row["_inv_norm"],x))]
-    if len(g)>=2: gs.append(g)
-    return gs
+def _build_otm_groups(df, cfg):
+    """
+    Pre-computes all candidate OTM groups from a DataFrame.
+    Returns a dict: row_index → list of candidate groups (each group is a DataFrame).
+
+    Key insight: OTM only makes sense when 2+ rows share the same
+    GSTIN+Invoice (or similar). Pre-grouping using pandas groupby is
+    O(n log n) — far faster than calling find_groups per row.
+
+    Groups built:
+      G1: same GSTIN + same inv_norm + same FY     (exact OTM — most common)
+      G2: same GSTIN + same inv_norm (fuzzy aggr)  (fuzzy invoice OTM)
+      G3: same GSTIN + suffix/prefix inv            (suffix/prefix OTM)
+      G4: same inv_norm + name match                (GSTIN-mismatch OTM)
+    Fuzzy/vendor-name groups (G2-G4) are only built for rows where G1 failed.
+    """
+    FI   = cfg["fuzzy_inv_threshold"]
+    VN_T = cfg["vendor_name_threshold"]
+
+    # G1: Exact GSTIN + inv_norm + FY — vectorized groupby
+    g1_groups = {}
+    for (gstin, inv, fy), grp in df.groupby(["gstin","_inv_norm","_fy"]):
+        if inv == "" or len(grp) < 2:
+            continue
+        for idx in grp.index:
+            g1_groups.setdefault(idx, []).append(grp)
+
+    # For rows without G1 candidates, build G2/G3/G4
+    # Only process rows that actually have potential — same GSTIN bucket
+    gstin_groups = {}
+    for j, row in df.iterrows():
+        gstin_groups.setdefault(row["gstin"], []).append(j)
+
+    inv_groups = {}  # inv_norm → list of indices
+    for j, row in df.iterrows():
+        if row["_inv_norm"]:
+            inv_groups.setdefault(row["_inv_norm"], []).append(j)
+
+    extra_groups = {}  # row_index → additional candidate groups
+
+    for i, row in df.iterrows():
+        if i in g1_groups:
+            continue  # G1 already found — skip expensive fuzzy work
+
+        same_gstin = [j for j in gstin_groups.get(row["gstin"], [])
+                      if j != i and df.loc[j, "_fy"] == row["_fy"]]
+
+        if len(same_gstin) >= 2:
+            # G2: fuzzy invoice within same GSTIN
+            fuzzy_ids = [j for j in same_gstin
+                         if fuzz.ratio(row["_inv_aggr"], df.loc[j,"_inv_aggr"]) >= FI
+                         and df.loc[j,"_inv_norm"] != row["_inv_norm"]]
+            if len(fuzzy_ids) >= 2:
+                extra_groups.setdefault(i, []).append(df.loc[fuzzy_ids])
+
+            # G3: suffix/prefix within same GSTIN
+            sp_ids = [j for j in same_gstin
+                      if is_suffix_prefix_match(row["_inv_norm"], df.loc[j,"_inv_norm"])
+                      and df.loc[j,"_inv_norm"] != row["_inv_norm"]]
+            if len(sp_ids) >= 2:
+                extra_groups.setdefault(i, []).append(df.loc[sp_ids])
+
+        # G4: same invoice norm, different GSTIN, vendor name match
+        same_inv = [j for j in inv_groups.get(row["_inv_norm"], [])
+                    if j != i
+                    and df.loc[j,"gstin"] != row["gstin"]
+                    and df.loc[j,"_fy"] == row["_fy"]
+                    and fuzz.token_sort_ratio(row["_name_norm"], df.loc[j,"_name_norm"]) >= VN_T]
+        if len(same_inv) >= 2:
+            extra_groups.setdefault(i, []).append(df.loc[same_inv])
+
+    # Merge g1_groups and extra_groups
+    all_groups = {}
+    for idx, gs in g1_groups.items():
+        all_groups.setdefault(idx, []).extend(gs)
+    for idx, gs in extra_groups.items():
+        all_groups.setdefault(idx, []).extend(gs)
+
+    return all_groups
 
 
 def phase2_one_to_many(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label="Phase 2",log_fn=print):
-    EXACT_OTM={OTM,OTM_CB,OTM_FI,OTM_GS,OTM_SP}
-    VAR_OTM  ={OTM_1,OTM_5,OTM_GS_1,OTM_GS_5,OTM_SP_1,OTM_SP_5}
+    EXACT_OTM = {OTM, OTM_CB, OTM_FI, OTM_GS, OTM_SP}
+    VAR_OTM   = {OTM_1, OTM_5, OTM_GS_1, OTM_GS_5, OTM_SP_1, OTM_SP_5}
     log_fn(f"\n  [{label}] One-to-Many..."
            + (" (exact)" if exact_only else " (variance)" if variance_only else ""))
-    count,flagged=0,[]
-    for i,r2b in gstr2b.iterrows():
+
+    pr_um  = pr[~pr.index.isin(mpr)]
+    g2b_um = gstr2b[~gstr2b.index.isin(m2b)]
+    count, flagged = 0, []
+
+    # Pre-compute candidate groups for both sides — O(n log n)
+    pr_candidate_groups  = _build_otm_groups(pr_um,  cfg)
+    b2_candidate_groups  = _build_otm_groups(g2b_um, cfg)
+
+    # Direction A: one 2B row → many PR rows
+    for i, r2b in g2b_um.iterrows():
         if i in m2b: continue
-        gs=_find_groups(r2b,pr[~pr.index.isin(mpr)],cfg)
-        br,bf=None,None
-        for g in gs:
-            res=classify_otm(r2b,g,cfg)
+        # Look up PR groups where this 2B row's counterparts appear
+        # We find PR groups keyed by matching GSTIN+inv from the PR side
+        gs = pr_candidate_groups.get(
+            # Find PR indices that would group with this 2B row
+            None, []
+        )
+        # Direct approach: find groups in PR that match this 2B row's key
+        key_gs  = pr_um[(pr_um["gstin"]     == r2b["gstin"]) &
+                        (pr_um["_inv_norm"]  == r2b["_inv_norm"]) &
+                        (pr_um["_inv_norm"]  != "") &
+                        (pr_um["_fy"]        == r2b["_fy"]) &
+                        (~pr_um.index.isin(mpr))]
+        groups = []
+        if len(key_gs) >= 2:
+            groups.append(key_gs)
+
+        # Also check extra groups from pr_candidate_groups that match
+        for pr_idx, pr_gs_list in pr_candidate_groups.items():
+            if pr_idx in mpr: continue
+            pr_row = pr_um.loc[pr_idx] if pr_idx in pr_um.index else None
+            if pr_row is None: continue
+            if pr_row["gstin"] == r2b["gstin"] and pr_row["_inv_norm"] == r2b["_inv_norm"]:
+                continue  # already covered by key_gs above
+            for g in pr_gs_list:
+                if g.index.isin(mpr).any(): continue
+                if classify_otm(r2b, g, cfg) is not None:
+                    groups.append(g)
+                    break
+
+        br, bf = None, None
+        for g in groups:
+            g_clean = g[~g.index.isin(mpr)]
+            if len(g_clean) < 2: continue
+            res = classify_otm(r2b, g_clean, cfg)
             if res is None: continue
-            p,lbl,ir=res
+            p, lbl, ir = res
             if exact_only    and lbl not in EXACT_OTM: continue
             if variance_only and lbl not in VAR_OTM:   continue
             if ir:
-                if br is None or p<br[0]: br=(p,g,lbl)
+                if br is None or p < br[0]: br = (p, g_clean, lbl)
             else:
-                if bf is None or p<bf[0]: bf=(p,g,lbl)
-        if br: _,g,lbl=br; mark_2b_to_many_pr(i,list(g.index),lbl,gstr2b,pr,m2b,mpr); count+=1
-        elif bf: _,g,lbl=bf; flagged.append(("2b_to_pr",i,list(g.index),lbl))
-    for j,rpr in pr.iterrows():
+                if bf is None or p < bf[0]: bf = (p, g_clean, lbl)
+
+        if br:
+            _, g, lbl = br
+            mark_2b_to_many_pr(i, list(g.index), lbl, gstr2b, pr, m2b, mpr)
+            count += 1
+        elif bf:
+            _, g, lbl = bf
+            flagged.append(("2b_to_pr", i, list(g.index), lbl))
+
+    # Direction B: one PR row → many 2B rows
+    for j, rpr in pr_um.iterrows():
         if j in mpr: continue
-        gs=_find_groups(rpr,gstr2b[~gstr2b.index.isin(m2b)],cfg)
-        br,bf=None,None
-        for g in gs:
-            res=classify_otm(rpr,g,cfg)
+        key_gs = g2b_um[(g2b_um["gstin"]    == rpr["gstin"]) &
+                        (g2b_um["_inv_norm"] == rpr["_inv_norm"]) &
+                        (g2b_um["_inv_norm"] != "") &
+                        (g2b_um["_fy"]       == rpr["_fy"]) &
+                        (~g2b_um.index.isin(m2b))]
+        groups = []
+        if len(key_gs) >= 2:
+            groups.append(key_gs)
+
+        br, bf = None, None
+        for g in groups:
+            g_clean = g[~g.index.isin(m2b)]
+            if len(g_clean) < 2: continue
+            res = classify_otm(rpr, g_clean, cfg)
             if res is None: continue
-            p,lbl,ir=res
+            p, lbl, ir = res
             if exact_only    and lbl not in EXACT_OTM: continue
             if variance_only and lbl not in VAR_OTM:   continue
             if ir:
-                if br is None or p<br[0]: br=(p,g,lbl)
+                if br is None or p < br[0]: br = (p, g_clean, lbl)
             else:
-                if bf is None or p<bf[0]: bf=(p,g,lbl)
-        if br: _,g,lbl=br; mark_pr_to_many_2b(j,list(g.index),lbl,gstr2b,pr,m2b,mpr); count+=1
-        elif bf: _,g,lbl=bf; flagged.append(("pr_to_2b",j,list(g.index),lbl))
+                if bf is None or p < bf[0]: bf = (p, g_clean, lbl)
+
+        if br:
+            _, g, lbl = br
+            mark_pr_to_many_2b(j, list(g.index), lbl, gstr2b, pr, m2b, mpr)
+            count += 1
+        elif bf:
+            _, g, lbl = bf
+            flagged.append(("pr_to_2b", j, list(g.index), lbl))
+
     log_fn(f"    -> {count} groups matched.")
     return flagged
 
