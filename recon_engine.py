@@ -680,33 +680,47 @@ def create_template():
     Creates a downloadable Excel template with correct column headers.
     Returns BytesIO object.
     """
+    import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
 
-    b2_cols = ['Sr. No','Supplier GSTN','Supplier Name','Invoice Number',
-               'Invoice Date','Taxable Value','IGST','CGST','SGST','2B Month']
-    pr_cols = ['Sr. No','Supplier GSTN','Supplier Name','Invoice Number',
-               'Invoice Date','Taxable Value','IGST','CGST','SGST','Booking Month']
+    b2_cols = [
+        "Sr. No", "Supplier GSTN", "Supplier Name", "Invoice Number",
+        "Invoice Date", "Taxable Value", "IGST", "CGST", "SGST", "2B Month"
+    ]
+    pr_cols = [
+        "Sr. No", "Supplier GSTN", "Supplier Name", "Invoice Number",
+        "Invoice Date", "Taxable Value", "IGST", "CGST", "SGST", "Booking Month"
+    ]
 
-    b2_sample = [{'Sr. No':1,'Supplier GSTN':'27AABCU9603R1ZX','Supplier Name':'ABC Traders',
-                  'Invoice Number':'INV/2025/001','Invoice Date':'01-04-2025',
-                  'Taxable Value':100000,'IGST':18000,'CGST':0,'SGST':0,'2B Month':'Apr-2025'}]
-    pr_sample = [{'Sr. No':1,'Supplier GSTN':'27AABCU9603R1ZX','Supplier Name':'ABC Traders',
-                  'Invoice Number':'INV/2025/001','Invoice Date':'01-04-2025',
-                  'Taxable Value':100000,'IGST':18000,'CGST':0,'SGST':0,'Booking Month':'Apr-2025'}]
+    wb = openpyxl.Workbook()
+
+    for sheet_name, cols in [("2B", b2_cols), ("PR", pr_cols)]:
+        ws = wb.create_sheet(title=sheet_name)
+
+        # Write headers
+        for col_idx, col_name in enumerate(cols, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=col_name)
+            cell.font      = Font(bold=True, color="FFFFFF")
+            cell.fill      = PatternFill("solid", fgColor="1A5276")
+            cell.alignment = Alignment(horizontal="center")
+            ws.column_dimensions[get_column_letter(col_idx)].width = 20
+
+        # Write one sample row
+        sample = [
+            1, "27AABCU9603R1ZX", "ABC Traders", "INV/2025/001",
+            "01-04-2025", 100000, 18000, 0, 0,
+            "Apr-2025" if sheet_name == "2B" else "Apr-2025"
+        ]
+        for col_idx, val in enumerate(sample, start=1):
+            ws.cell(row=2, column=col_idx, value=val)
+
+    # Remove default sheet
+    if "Sheet" in wb.sheetnames:
+        del wb["Sheet"]
 
     out = BytesIO()
-    with pd.ExcelWriter(out, engine='openpyxl') as writer:
-        pd.DataFrame(b2_sample, columns=b2_cols).to_excel(writer, sheet_name='2B', index=False)
-        pd.DataFrame(pr_sample, columns=pr_cols).to_excel(writer, sheet_name='PR', index=False)
-        for sname, cols in [('2B', b2_cols), ('PR', pr_cols)]:
-            ws = writer.sheets[sname]
-            for cc in ws.columns:
-                ml = max((len(str(c.value or '')) for c in cc), default=10)
-                ws.column_dimensions[cc[0].column_letter].width = min(ml+4, 25)
-            for cell in ws[1]:
-                cell.font      = Font(bold=True, color='FFFFFF')
-                cell.fill      = PatternFill('solid', fgColor='1A5276')
-                cell.alignment = Alignment(horizontal='center')
+    wb.save(out)
     out.seek(0)
     return out
 
