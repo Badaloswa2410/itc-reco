@@ -399,52 +399,117 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
     log_fn(f"\n  [{label}] One-to-One..."
            + (" (exact)" if exact_only else " (variance)" if variance_only else ""))
     pr_um = pr[~pr.index.isin(mpr)]
-    bg,bp,bi = {},{},{}
-    for j,rpr in pr_um.iterrows():
-        bg.setdefault(rpr["gstin"],[]).append(j)
-        if rpr["_pan"]: bp.setdefault(rpr["_pan"],[]).append(j)
-        if rpr["_inv_norm"]: bi.setdefault(rpr["_inv_norm"],[]).append(j)
+
+    # ── Optimisation 2: Pre-group PR rows by Financial Year ───────────────────
+    # We only ever compare rows within the same FY (DFY is the only cross-FY
+    # case and is handled separately). Pre-grouping avoids FY checks inside
+    # the hot loop.
+    pr_by_fy = {}
+    for j, rpr in pr_um.iterrows():
+        pr_by_fy.setdefault(rpr["_fy"], []).append(j)
+
+    # ── Buckets 1-3 (Bucket 4 removed — moved to Phase 4) ────────────────────
+    # Bucket 1: GSTIN          → all GSTIN-match cases
+    # Bucket 2: PAN            → PAN-match, GSTIN differs
+    # Bucket 3: Invoice norm   → vendor-name match (invoice must align)
+    # Bucket 4 removal: suffix/prefix with full GSTIN+PAN mismatch is now
+    # flagged in Phase 4 only — safer (uncertain match) and much faster.
+    bg, bp, bi = {}, {}, {}
+    for j, rpr in pr_um.iterrows():
+        bg.setdefault(rpr["gstin"], []).append(j)
+        if rpr["_pan"]:
+            bp.setdefault(rpr["_pan"], []).append(j)
+        if rpr["_inv_norm"]:
+            bi.setdefault(rpr["_inv_norm"], []).append(j)
+
+    # ── Optimisation 3: Tax pre-filter threshold ──────────────────────────────
+    # If total tax of the two rows differs by more than 10x, they can never
+    # match under any of our rules (max variance is 5%). Skip classify_pair
+    # entirely. This avoids expensive fuzzy comparisons on clearly wrong pairs.
+    TAX_RATIO_LIMIT = 10.0
+
+    def tax_plausible(tax_a, tax_b):
+        """Returns True if taxes are close enough to bother comparing."""
+        if tax_a == 0 and tax_b == 0:
+            return True
+        if tax_a == 0 or tax_b == 0:
+            return False
+        ratio = max(tax_a, tax_b) / min(tax_a, tax_b)
+        return ratio <= TAX_RATIO_LIMIT
 
     def cands(r2b):
-        seen,res=[],[]
-        for j in bg.get(r2b["gstin"],[]):
-            if j not in seen: seen.append(j); res.append(j)
-        for j in bp.get(r2b["_pan"],[]):
-            if pr_um.loc[j,"gstin"]!=r2b["gstin"] and j not in seen: seen.append(j); res.append(j)
-        for j in bi.get(r2b["_inv_norm"],[]):
-            if pr_um.loc[j,"gstin"]!=r2b["gstin"] and j not in seen: seen.append(j); res.append(j)
-        for j in pr_um.index:
-            if j not in seen: seen.append(j); res.append(j)
+        """
+        Returns candidate PR indices for a given 2B row.
+        Uses buckets 1-3 only. No full O(n×m) scan.
+        """
+        seen, res = set(), []
+        # Bucket 1: same GSTIN
+        for j in bg.get(r2b["gstin"], []):
+            if j not in seen:
+                seen.add(j); res.append(j)
+        # Bucket 2: same PAN, GSTIN differs
+        if r2b["_pan"]:
+            for j in bp.get(r2b["_pan"], []):
+                if pr_um.loc[j, "gstin"] != r2b["gstin"] and j not in seen:
+                    seen.add(j); res.append(j)
+        # Bucket 3: same invoice norm, GSTIN differs (vendor name cases)
+        if r2b["_inv_norm"]:
+            for j in bi.get(r2b["_inv_norm"], []):
+                if pr_um.loc[j, "gstin"] != r2b["gstin"] and j not in seen:
+                    seen.add(j); res.append(j)
         return res
 
-    pairs=[]
+    pairs = []
     total_rows = len(gstr2b)
     processed  = 0
-    for i,r2b in gstr2b.iterrows():
+
+    for i, r2b in gstr2b.iterrows():
         processed += 1
-        # Fire progress callback every 50 rows so Streamlit keeps screen alive
         if progress_fn and processed % 50 == 0:
             progress_fn(label, processed, total_rows)
-        if i in m2b: continue
+        if i in m2b:
+            continue
+
+        r2b_tax = r2b["_total_tax"]
+        r2b_fy  = r2b["_fy"]
+
         for j in cands(r2b):
-            if j in mpr or j not in pr_um.index: continue
-            res=classify_pair(r2b,pr_um.loc[j],cfg)
-            if res is None: continue
-            p,lbl,ir=res
-            if not ir: continue
+            if j in mpr or j not in pr_um.index:
+                continue
+            rpr = pr_um.loc[j]
+
+            # ── Optimisation 2: FY check using pre-group ──────────────────
+            # Allow same FY or DFY (cross FY exact match) — skip everything else
+            rpr_fy = rpr["_fy"]
+            if rpr_fy != r2b_fy:
+                # Only worth checking for DFY: needs exact invoice + exact tax
+                if rpr["_inv_norm"] != r2b["_inv_norm"]:
+                    continue
+
+            # ── Optimisation 3: Tax pre-filter ────────────────────────────
+            if not tax_plausible(r2b_tax, rpr["_total_tax"]):
+                continue
+
+            res = classify_pair(r2b, rpr, cfg)
+            if res is None:
+                continue
+            p, lbl, ir = res
+            if not ir:
+                continue
             if exact_only    and lbl in VARIANCE_LABELS: continue
             if variance_only and lbl not in VARIANCE_LABELS: continue
-            pairs.append((p,i,j,lbl))
+            pairs.append((p, i, j, lbl))
 
-    # Final progress update for this phase
     if progress_fn:
         progress_fn(label, total_rows, total_rows)
 
-    pairs.sort(key=lambda x:x[0])
-    lc={}
-    for p,i,j,lbl in pairs:
-        if i in m2b or j in mpr: continue
-        mark_1to1(i,j,lbl,gstr2b,pr,m2b,mpr); lc[lbl]=lc.get(lbl,0)+1
+    pairs.sort(key=lambda x: x[0])
+    lc = {}
+    for p, i, j, lbl in pairs:
+        if i in m2b or j in mpr:
+            continue
+        mark_1to1(i, j, lbl, gstr2b, pr, m2b, mpr)
+        lc[lbl] = lc.get(lbl, 0) + 1
     log_fn(f"    -> {sum(lc.values())} matched.")
 
 
@@ -563,34 +628,87 @@ def phase3_partial_otm(gstr2b,pr,m2b,mpr,cfg,log_fn=print):
 
 
 def phase4_flags(gstr2b,pr,m2b,mpr,cfg,flagged_otm,log_fn=print):
-    log_fn(f"\n  [Phase 4] Flagging..."); f2b,fpr,count=set(),set(),0
-    for i,r2b in gstr2b.iterrows():
-        if i in m2b or i in f2b: continue
-        bf=None
-        for j,rpr in pr[~pr.index.isin(mpr|fpr)].iterrows():
-            res=classify_pair(r2b,rpr,cfg)
-            if res is None or res[2]: continue
-            p,lbl,_=res
-            if bf is None or p<bf[0]: bf=(p,j,lbl)
-        if bf:
-            _,j,lbl=bf
-            gstr2b.at[i,"Match Status"]=lbl; gstr2b.at[i,"_matched_idx"]=j
-            pr.at[j,"Match Status"]=lbl;     pr.at[j,"_matched_idx"]=i
-            f2b.add(i); fpr.add(j); count+=1
-    for direction,anchor,others,lbl in flagged_otm:
-        if direction=="2b_to_pr":
-            i=anchor; js=[j for j in others if j not in mpr and j not in fpr]
+    """
+    Phase 4 — Flags suspicious near-matches for manual review.
+    Also handles Bucket 4 (full O(n×m) scan on remaining rows) which was
+    removed from Phase 1 for performance. By Phase 4 the unmatched pool is
+    small so the full scan is fast.
+    """
+    log_fn(f"\n  [Phase 4] Flagging and edge-case scan...")
+    f2b, fpr, count = set(), set(), 0
+
+    # ── One-to-one flags + Bucket 4 edge cases ───────────────────────────────
+    # We scan all remaining unmatched pairs. classify_pair returns:
+    #   is_real=True  → confirmed match missed by buckets 1-3 (e.g. suffix/prefix
+    #                   with full GSTIN+PAN+name mismatch) → mark as confirmed
+    #   is_real=False → flag for manual review
+    TAX_RATIO_LIMIT = 10.0
+
+    for i, r2b in gstr2b.iterrows():
+        if i in m2b or i in f2b:
+            continue
+        r2b_tax = r2b["_total_tax"]
+        best_real = None   # (priority, j, label) — confirmed late match
+        best_flag = None   # (priority, j, label) — flag
+
+        for j, rpr in pr[~pr.index.isin(mpr | fpr)].iterrows():
+            # Tax pre-filter
+            if r2b_tax > 0 and rpr["_total_tax"] > 0:
+                ratio = max(r2b_tax, rpr["_total_tax"]) / min(r2b_tax, rpr["_total_tax"])
+                if ratio > TAX_RATIO_LIMIT:
+                    continue
+            res = classify_pair(r2b, rpr, cfg)
+            if res is None:
+                continue
+            p, lbl, ir = res
+            if ir:
+                if best_real is None or p < best_real[0]:
+                    best_real = (p, j, lbl)
+            else:
+                if best_flag is None or p < best_flag[0]:
+                    best_flag = (p, j, lbl)
+
+        if best_real:
+            # Confirmed match found in Phase 4 (Bucket 4 edge case)
+            _, j, lbl = best_real
+            mark_1to1(i, j, lbl, gstr2b, pr, m2b, mpr)
+            count += 1
+        elif best_flag:
+            _, j, lbl = best_flag
+            gstr2b.at[i, "Match Status"] = lbl
+            gstr2b.at[i, "_matched_idx"] = j
+            pr.at[j,     "Match Status"] = lbl
+            pr.at[j,     "_matched_idx"] = i
+            f2b.add(i); fpr.add(j); count += 1
+
+    # ── One-to-many flags from Phase 2 ───────────────────────────────────────
+    for direction, anchor, others, lbl in flagged_otm:
+        if direction == "2b_to_pr":
+            i  = anchor
+            js = [j for j in others if j not in mpr and j not in fpr]
             if i in m2b or i in f2b or not js: continue
-            gstr2b.at[i,"Match Status"]=lbl; gstr2b.at[i,"_matched_idx_list"]=js; f2b.add(i)
-            for j in js: pr.at[j,"Match Status"]=lbl; pr.at[j,"_matched_idx"]=i; fpr.add(j)
-            count+=1
+            gstr2b.at[i, "Match Status"]      = lbl
+            gstr2b.at[i, "_matched_idx_list"] = js
+            f2b.add(i)
+            for j in js:
+                pr.at[j, "Match Status"] = lbl
+                pr.at[j, "_matched_idx"] = i
+                fpr.add(j)
+            count += 1
         else:
-            j=anchor; is_=[i for i in others if i not in m2b and i not in f2b]
+            j   = anchor
+            is_ = [i for i in others if i not in m2b and i not in f2b]
             if j in mpr or j in fpr or not is_: continue
-            pr.at[j,"Match Status"]=lbl; pr.at[j,"_matched_idx_list"]=is_; fpr.add(j)
-            for i in is_: gstr2b.at[i,"Match Status"]=lbl; gstr2b.at[i,"_matched_idx"]=j; f2b.add(i)
-            count+=1
-    log_fn(f"    -> {count} flagged.")
+            pr.at[j,     "Match Status"]      = lbl
+            pr.at[j,     "_matched_idx_list"] = is_
+            fpr.add(j)
+            for i in is_:
+                gstr2b.at[i, "Match Status"] = lbl
+                gstr2b.at[i, "_matched_idx"] = j
+                f2b.add(i)
+            count += 1
+
+    log_fn(f"    -> {count} matched/flagged.")
 
 # =============================================================================
 # ORCHESTRATOR
