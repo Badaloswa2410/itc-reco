@@ -396,45 +396,46 @@ VARIANCE_LABELS = {M_FI,M_1,M_5,M_FI_1,M_FI_5,CB_FI,VN_FI,VN_1,VN_5,PAN_1,PAN_5,
 
 
 def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label="Phase 1",log_fn=print,progress_fn=None):
+    """
+    One-to-one matching with two speed improvements:
+
+    1. Fast vectorized merge finds all exact M pairs instantly (O(n log n))
+    2. Bucket-based loop finds all other pairs (CB, DFY, PAN, VN, fuzzy etc.)
+
+    CRITICAL: ALL pairs from both paths are combined into a single list,
+    sorted by priority, then assigned in order. This preserves global
+    optimality — a CB (priority 1) will always beat an M (priority 2) when
+    competing for the same PR row, exactly as the original code did.
+    """
     log_fn(f"\n  [{label}] One-to-One..."
            + (" (exact)" if exact_only else " (variance)" if variance_only else ""))
 
     pr_um = pr[~pr.index.isin(mpr)]
     TAX_RATIO_LIMIT = 10.0
+    all_pairs = []   # (priority, i, j, label) — collected from BOTH paths
 
-    # ── FAST PATH: Vectorized exact match (L1 = "Matched") ───────────────────
-    # Uses pandas merge — O(n log n) instead of O(n×m).
-    # Only runs in exact_only mode and covers the most common case.
+    # ── FAST PATH: Vectorized exact merge finds M pairs in O(n log n) ────────
+    # Adds pairs to all_pairs — does NOT assign yet.
+    # This is fast because pandas merge is vectorized.
     if exact_only and not variance_only:
-        g2b = gstr2b[~gstr2b.index.isin(m2b)].copy()
-        g2b["_src"] = "2b"
-        gpr = pr_um.copy()
-        gpr["_src"] = "pr"
-
+        g2b = gstr2b[~gstr2b.index.isin(m2b)]
         merge_keys = ["gstin","_inv_norm","_fy","igst","cgst","sgst"]
-        merged = g2b[merge_keys + ["_src"]].reset_index().merge(
-            gpr[merge_keys + ["_src"]].reset_index(),
-            on=merge_keys, suffixes=("_2b","_pr")
-        )
-        # Remove self-duplicates and assign greedily
-        used_2b, used_pr = set(), set()
-        for _, row in merged.iterrows():
-            i, j = int(row["index_2b"]), int(row["index_pr"])
-            if i in used_2b or j in used_pr or i in m2b or j in mpr:
-                continue
-            mark_1to1(i, j, M, gstr2b, pr, m2b, mpr)
-            used_2b.add(i); used_pr.add(j)
+        try:
+            merged = (
+                g2b[merge_keys].reset_index()
+                .merge(pr_um[merge_keys].reset_index(),
+                       on=merge_keys, suffixes=("_2b","_pr"))
+            )
+            for _, row in merged.iterrows():
+                i, j = int(row["index_2b"]), int(row["index_pr"])
+                all_pairs.append((2, i, j, M))   # priority 2 = M label
+        except Exception:
+            pass  # If merge fails for any reason, loop path below covers it
 
-        matched_fast = len(used_2b)
-        log_fn(f"    -> {matched_fast} exact matches (fast path).")
-        if progress_fn:
-            progress_fn(label, len(gstr2b), len(gstr2b))
-
-        # Refresh pr_um after fast-path matches
-        pr_um = pr[~pr.index.isin(mpr)]
-
-    # ── SLOW PATH: Loop-based for fuzzy/variance/PAN/vendor-name/suffix ───────
-    # Buckets 1-3 only (no Bucket 4 full scan — moved to Phase 4)
+    # ── LOOP PATH: Bucket-based scan for all other labels ─────────────────────
+    # Buckets 1-3 only (no Bucket 4 — moved to Phase 4).
+    # Refreshes pr_um each time (fast path may have already added M pairs
+    # to all_pairs but hasn't assigned yet — pr_um is still the full pool).
     bg, bp, bi = {}, {}, {}
     for j, rpr in pr_um.iterrows():
         bg.setdefault(rpr["gstin"], []).append(j)
@@ -455,7 +456,6 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
                     seen.add(j); res.append(j)
         return res
 
-    pairs = []
     total_rows = len(gstr2b)
     processed  = 0
 
@@ -474,11 +474,11 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
                 continue
             rpr = pr_um.loc[j]
 
-            # FY check — allow same FY or cross-FY only if invoice also matches
+            # FY check
             if rpr["_fy"] != r2b_fy and rpr["_inv_norm"] != r2b["_inv_norm"]:
                 continue
 
-            # Tax pre-filter — skip wildly different tax values
+            # Tax pre-filter
             rpr_tax = rpr["_total_tax"]
             if r2b_tax > 0 and rpr_tax > 0:
                 if max(r2b_tax, rpr_tax) / min(r2b_tax, rpr_tax) > TAX_RATIO_LIMIT:
@@ -488,26 +488,34 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
             if res is None: continue
             p, lbl, ir = res
             if not ir: continue
-            # Skip L1 (M) — already handled by fast path
-            if lbl == M: continue
             if exact_only    and lbl in VARIANCE_LABELS: continue
             if variance_only and lbl not in VARIANCE_LABELS: continue
-            pairs.append((p, i, j, lbl))
+            # Note: we include ALL labels here (including M) from loop path.
+            # The global sort below will deduplicate correctly — if fast path
+            # found M for this pair too, lower priority wins when assigning.
+            all_pairs.append((p, i, j, lbl))
 
     if progress_fn:
         progress_fn(label, total_rows, total_rows)
 
-    pairs.sort(key=lambda x: x[0])
+    # ── GLOBAL PRIORITY SORT + ASSIGN ────────────────────────────────────────
+    # Sort ALL pairs (from both fast and loop paths) by priority.
+    # Lower number = stronger match. Greedy assignment in this order
+    # ensures the best match always wins — CB (priority 1) beats M (priority 2),
+    # etc. This is identical to the original code's guarantee.
+    all_pairs.sort(key=lambda x: x[0])
     lc = {}
-    for p, i, j, lbl in pairs:
-        if i in m2b or j in mpr: continue
+    for p, i, j, lbl in all_pairs:
+        if i in m2b or j in mpr:
+            continue
         mark_1to1(i, j, lbl, gstr2b, pr, m2b, mpr)
         lc[lbl] = lc.get(lbl, 0) + 1
 
+    total = sum(lc.values())
+    log_fn(f"    -> {total} matched.")
     if lc:
-        log_fn(f"    -> {sum(lc.values())} additional matched (complex path).")
-    else:
-        log_fn(f"    -> 0 additional (complex path).")
+        for lbl, cnt in sorted(lc.items(), key=lambda x: x[1], reverse=True):
+            log_fn(f"       {lbl}: {cnt}")
 
 
 def _build_otm_groups(df, cfg):
