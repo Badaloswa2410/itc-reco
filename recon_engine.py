@@ -397,64 +397,31 @@ VARIANCE_LABELS = {M_FI,M_1,M_5,M_FI_1,M_FI_5,CB_FI,VN_FI,VN_1,VN_5,PAN_1,PAN_5,
 
 def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label="Phase 1",log_fn=print,progress_fn=None):
     """
-    One-to-one matching — fast and correct.
+    One-to-one matching.
 
-    Order of operations (exact_only mode):
-      Step 1: Fast CB scan  — GSTIN + invoice exact match, check is_cross_booked
-              Assign CB first (priority 1) so M cannot steal these rows.
-      Step 2: Fast M merge  — vectorized pandas merge for exact matches.
-              Assigns M only to rows not already taken by CB.
-      Step 3: Loop path     — runs on the now-small unmatched pool.
-              Finds fuzzy, variance, PAN, vendor-name matches.
+    exact_only mode:
+      1. Vectorized pandas merge finds all exact M pairs instantly → assigns immediately
+      2. Loop runs on the now-smaller unmatched pool for all other labels
+         (fuzzy, variance, PAN, vendor-name, suffix/prefix, DFY)
+         Skips M (already done). Skips unmatched rows (already assigned).
 
-    This gives the same speed as the "Congratulations" version AND the
-    same quality as the original code (CB always beats M).
+    variance_only mode:
+      Loop only — finds M_1, M_5, M_FI, VN_1, VN_5 etc.
     """
     log_fn(f"\n  [{label}] One-to-One..."
            + (" (exact)" if exact_only else " (variance)" if variance_only else ""))
 
-    pr_um = pr[~pr.index.isin(mpr)]
     TAX_RATIO_LIMIT = 10.0
 
-    # ── STEP 1: CB fast scan (exact_only only) ────────────────────────────────
-    # Cross-booked: one side has IGST, other has CGST+SGST for same GSTIN+invoice.
-    # We only check rows where one side has IGST > 0 (cross-booking requires it).
+    # ── FAST PATH: vectorized merge for M (exact_only only) ───────────────────
     if exact_only and not variance_only:
-        CT = cfg["cross_book_tolerance"]
-        # Group PR by GSTIN+invoice+FY for fast CB lookup
-        # Only include PR rows that have IGST > 0 OR CGST+SGST > 0
-        pr_gstin_inv = {}
-        for j, rpr in pr_um.iterrows():
-            if rpr["igst"] == 0 and (rpr["cgst"] == 0 or rpr["sgst"] == 0):
-                continue  # can't be cross-booked
-            key = (rpr["gstin"], rpr["_inv_norm"], rpr["_fy"])
-            pr_gstin_inv.setdefault(key, []).append(j)
-
-        if pr_gstin_inv:  # only scan if there are any CB candidates
-            g2b_um = gstr2b[~gstr2b.index.isin(m2b)]
-            for i, r2b in g2b_um.iterrows():
-                if i in m2b: continue
-                # Only check 2B rows that could be cross-booked
-                if r2b["igst"] == 0 and (r2b["cgst"] == 0 or r2b["sgst"] == 0):
-                    continue
-                key = (r2b["gstin"], r2b["_inv_norm"], r2b["_fy"])
-                for j in pr_gstin_inv.get(key, []):
-                    if j in mpr: continue
-                    rpr = pr_um.loc[j]
-                    if is_cross_booked_pair(r2b, rpr, CT):
-                        mark_1to1(i, j, CB, gstr2b, pr, m2b, mpr)
-                        break
-
-    # ── STEP 2: M fast merge (exact_only only) ────────────────────────────────
-    # Vectorized pandas merge — O(n log n). Only runs on still-unmatched rows.
-    if exact_only and not variance_only:
-        g2b = gstr2b[~gstr2b.index.isin(m2b)]
-        pr_um2 = pr[~pr.index.isin(mpr)]
+        pr_um = pr[~pr.index.isin(mpr)]
+        g2b   = gstr2b[~gstr2b.index.isin(m2b)]
         merge_keys = ["gstin","_inv_norm","_fy","igst","cgst","sgst"]
         try:
             merged = (
                 g2b[merge_keys].reset_index()
-                .merge(pr_um2[merge_keys].reset_index(),
+                .merge(pr_um[merge_keys].reset_index(),
                        on=merge_keys, suffixes=("_2b","_pr"))
             )
             seen_2b, seen_pr = set(), set()
@@ -464,15 +431,16 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
                 if i in seen_2b or j in seen_pr: continue
                 mark_1to1(i, j, M, gstr2b, pr, m2b, mpr)
                 seen_2b.add(i); seen_pr.add(j)
+            log_fn(f"    -> {len(seen_2b)} exact matches (fast path).")
+            if progress_fn:
+                progress_fn(label, len(gstr2b), len(gstr2b))
         except Exception:
-            pass  # loop path below will catch M pairs as fallback
+            pass  # loop below catches M as fallback
 
-    # ── STEP 3: Loop path — small pool, non-M labels only ────────────────────
-    # By now most rows are matched (CB + M). Loop runs on the small remainder.
-    # Finds: fuzzy invoice, variance, PAN, vendor-name, suffix/prefix, DFY.
-    pr_um3 = pr[~pr.index.isin(mpr)]
+    # ── LOOP PATH: bucket-based, runs on remaining unmatched pool ─────────────
+    pr_um = pr[~pr.index.isin(mpr)]   # refreshed after fast path assignments
     bg, bp, bi = {}, {}, {}
-    for j, rpr in pr_um3.iterrows():
+    for j, rpr in pr_um.iterrows():
         bg.setdefault(rpr["gstin"], []).append(j)
         if rpr["_pan"]:      bp.setdefault(rpr["_pan"], []).append(j)
         if rpr["_inv_norm"]: bi.setdefault(rpr["_inv_norm"], []).append(j)
@@ -483,15 +451,15 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
             if j not in seen: seen.add(j); res.append(j)
         if r2b["_pan"]:
             for j in bp.get(r2b["_pan"], []):
-                if pr_um3.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
+                if pr_um.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
                     seen.add(j); res.append(j)
         if r2b["_inv_norm"]:
             for j in bi.get(r2b["_inv_norm"], []):
-                if pr_um3.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
+                if pr_um.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
                     seen.add(j); res.append(j)
         return res
 
-    pairs = []
+    pairs      = []
     total_rows = len(gstr2b)
     processed  = 0
 
@@ -505,9 +473,9 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
         r2b_fy  = r2b["_fy"]
 
         for j in cands(r2b):
-            if j in mpr or j not in pr_um3.index:
+            if j in mpr or j not in pr_um.index:
                 continue
-            rpr = pr_um3.loc[j]
+            rpr = pr_um.loc[j]
             if rpr["_fy"] != r2b_fy and rpr["_inv_norm"] != r2b["_inv_norm"]:
                 continue
             rpr_tax = rpr["_total_tax"]
@@ -518,8 +486,7 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
             if res is None: continue
             p, lbl, ir = res
             if not ir: continue
-            # Skip M and CB — already handled by fast paths above
-            if lbl in (M, CB): continue
+            if lbl == M: continue  # already handled by fast path
             if exact_only    and lbl in VARIANCE_LABELS: continue
             if variance_only and lbl not in VARIANCE_LABELS: continue
             pairs.append((p, i, j, lbl))
@@ -534,9 +501,12 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
         mark_1to1(i, j, lbl, gstr2b, pr, m2b, mpr)
         lc[lbl] = lc.get(lbl, 0) + 1
 
-    log_fn(f"    -> {sum(lc.values()) if lc else 0} matched (loop path).")
-    for lbl, cnt in sorted(lc.items(), key=lambda x: x[1], reverse=True):
-        log_fn(f"       {lbl}: {cnt}")
+    if lc:
+        log_fn(f"    -> {sum(lc.values())} additional matched:")
+        for lbl, cnt in sorted(lc.items(), key=lambda x: x[1], reverse=True):
+            log_fn(f"       {lbl}: {cnt}")
+
+
 
 
 def _build_otm_groups(df, cfg):
