@@ -33,11 +33,11 @@ SHEET_PR    = "PR"
 OUTPUT_FILE = os.path.join(FOLDER, "reconciliation_output.xlsx")
 
 GSTR2B_COLUMN_MAP = {
-    "supplier_name" : "Name of the Party",
-    "gstin"         : "GSTIN",
-    "invoice_no"    : "Invoice number",
+    "supplier_name" : "Supplier Name",
+    "gstin"         : "Supplier GSTN",
+    "invoice_no"    : "Invoice Number",
     "invoice_date"  : "Invoice Date",
-    "taxable_value" : "Taxable value",
+    "taxable_value" : "Taxable Value",
     "igst"          : "IGST",
     "cgst"          : "CGST",
     "sgst"          : "SGST",
@@ -46,8 +46,8 @@ GSTR2B_COLUMN_MAP = {
 
 PR_COLUMN_MAP = {
     "month"         : "Booking Month",
-    "supplier_name" : "Vendor name",
-    "gstin"         : "GSTIN",
+    "supplier_name" : "Supplier Name",
+    "gstin"         : "Supplier GSTN",
     "invoice_no"    : "Invoice Number",
     "invoice_date"  : "Invoice Date",
     "taxable_value" : "Taxable Value",
@@ -395,7 +395,7 @@ def mark_pr_to_many_2b(j,is_,lbl,gstr2b,pr,m2b,mpr):
 VARIANCE_LABELS = {M_FI,M_1,M_5,M_FI_1,M_FI_5,CB_FI,VN_FI,VN_1,VN_5,PAN_1,PAN_5,M_SP_1,M_SP_5}
 
 
-def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label="Phase 1",log_fn=print):
+def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label="Phase 1",log_fn=print,progress_fn=None):
     log_fn(f"\n  [{label}] One-to-One..."
            + (" (exact)" if exact_only else " (variance)" if variance_only else ""))
     pr_um = pr[~pr.index.isin(mpr)]
@@ -418,7 +418,13 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
         return res
 
     pairs=[]
+    total_rows = len(gstr2b)
+    processed  = 0
     for i,r2b in gstr2b.iterrows():
+        processed += 1
+        # Fire progress callback every 50 rows so Streamlit keeps screen alive
+        if progress_fn and processed % 50 == 0:
+            progress_fn(label, processed, total_rows)
         if i in m2b: continue
         for j in cands(r2b):
             if j in mpr or j not in pr_um.index: continue
@@ -429,6 +435,11 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
             if exact_only    and lbl in VARIANCE_LABELS: continue
             if variance_only and lbl not in VARIANCE_LABELS: continue
             pairs.append((p,i,j,lbl))
+
+    # Final progress update for this phase
+    if progress_fn:
+        progress_fn(label, total_rows, total_rows)
+
     pairs.sort(key=lambda x:x[0])
     lc={}
     for p,i,j,lbl in pairs:
@@ -585,13 +596,13 @@ def phase4_flags(gstr2b,pr,m2b,mpr,cfg,flagged_otm,log_fn=print):
 # ORCHESTRATOR
 # =============================================================================
 
-def run_reconciliation(gstr2b, pr, cfg=None, log_fn=print):
+def run_reconciliation(gstr2b, pr, cfg=None, log_fn=print, progress_fn=None):
     if cfg is None: cfg = DEFAULT_CFG.copy()
     m2b, mpr = set(), set()
-    _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=True,   label="Phase 1A",log_fn=log_fn)
-    flagged=phase2_one_to_many(gstr2b,pr,m2b,mpr,cfg,exact_only=True,   label="Phase 2A",log_fn=log_fn)
-    _phase1_run(gstr2b,pr,m2b,mpr,cfg,variance_only=True,label="Phase 1B",log_fn=log_fn)
-    flagged+=phase2_one_to_many(gstr2b,pr,m2b,mpr,cfg,variance_only=True,label="Phase 2B",log_fn=log_fn)
+    _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=True,    label="Phase 1A",log_fn=log_fn,progress_fn=progress_fn)
+    flagged=phase2_one_to_many(gstr2b,pr,m2b,mpr,cfg,exact_only=True,    label="Phase 2A",log_fn=log_fn)
+    _phase1_run(gstr2b,pr,m2b,mpr,cfg,variance_only=True, label="Phase 1B",log_fn=log_fn,progress_fn=progress_fn)
+    flagged+=phase2_one_to_many(gstr2b,pr,m2b,mpr,cfg,variance_only=True, label="Phase 2B",log_fn=log_fn)
     phase3_partial_otm(gstr2b,pr,m2b,mpr,cfg,log_fn=log_fn)
     phase4_flags(gstr2b,pr,m2b,mpr,cfg,flagged,log_fn=log_fn)
     return gstr2b, pr
@@ -662,6 +673,42 @@ def build_output(gstr2b, pr, output_path=None, log_fn=print):
     log_fn("  Output ready.")
     if output_path is None:
         target.seek(0); return target
+
+
+def create_template():
+    """
+    Creates a downloadable Excel template with correct column headers.
+    Returns BytesIO object.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    b2_cols = ['Sr. No','Supplier GSTN','Supplier Name','Invoice Number',
+               'Invoice Date','Taxable Value','IGST','CGST','SGST','2B Month']
+    pr_cols = ['Sr. No','Supplier GSTN','Supplier Name','Invoice Number',
+               'Invoice Date','Taxable Value','IGST','CGST','SGST','Booking Month']
+
+    b2_sample = [{'Sr. No':1,'Supplier GSTN':'27AABCU9603R1ZX','Supplier Name':'ABC Traders',
+                  'Invoice Number':'INV/2025/001','Invoice Date':'01-04-2025',
+                  'Taxable Value':100000,'IGST':18000,'CGST':0,'SGST':0,'2B Month':'Apr-2025'}]
+    pr_sample = [{'Sr. No':1,'Supplier GSTN':'27AABCU9603R1ZX','Supplier Name':'ABC Traders',
+                  'Invoice Number':'INV/2025/001','Invoice Date':'01-04-2025',
+                  'Taxable Value':100000,'IGST':18000,'CGST':0,'SGST':0,'Booking Month':'Apr-2025'}]
+
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine='openpyxl') as writer:
+        pd.DataFrame(b2_sample, columns=b2_cols).to_excel(writer, sheet_name='2B', index=False)
+        pd.DataFrame(pr_sample, columns=pr_cols).to_excel(writer, sheet_name='PR', index=False)
+        for sname, cols in [('2B', b2_cols), ('PR', pr_cols)]:
+            ws = writer.sheets[sname]
+            for cc in ws.columns:
+                ml = max((len(str(c.value or '')) for c in cc), default=10)
+                ws.column_dimensions[cc[0].column_letter].width = min(ml+4, 25)
+            for cell in ws[1]:
+                cell.font      = Font(bold=True, color='FFFFFF')
+                cell.fill      = PatternFill('solid', fgColor='1A5276')
+                cell.alignment = Alignment(horizontal='center')
+    out.seek(0)
+    return out
 
 
 def get_summary_dict(gstr2b, pr):

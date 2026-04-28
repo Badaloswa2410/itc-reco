@@ -139,6 +139,23 @@ st.markdown("""
 
 st.markdown("---")
 
+# Template download — available to all logged in users
+col_t1, col_t2 = st.columns([3, 1])
+with col_t1:
+    st.markdown("#### 📥 Download Input Template")
+    st.caption("Use this template to prepare your data. Fill in the 2B and PR sheets and upload below.")
+with col_t2:
+    template_bytes = engine.create_template()
+    st.download_button(
+        label="⬇️ Download Template",
+        data=template_bytes,
+        file_name="Raw Data Template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+st.markdown("---")
+
 # File uploader
 uploaded_file = st.file_uploader(
     "📂 Upload your **Raw Data.xlsx** file (must contain sheets: '2B' and 'PR')",
@@ -148,6 +165,15 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
     st.success(f"✅ File uploaded: **{uploaded_file.name}**")
+
+    st.warning("""
+⚠️ **Important — Please read before running:**
+- Do **NOT** close this browser tab while reconciliation is running
+- Do **NOT** refresh the page while reconciliation is running
+- Do **NOT** press the browser Back button while reconciliation is running
+- You **CAN** switch to other tabs or apps — the process will continue in the background
+- Wait for the ✅ success message before downloading the output
+""")
 
     if st.button("▶️ Run Reconciliation", type="primary", use_container_width=True):
 
@@ -164,35 +190,75 @@ if uploaded_file is not None:
 
         def log_fn(msg):
             logs.append(msg)
-            log_area.code("\n".join(logs), language="")
+            log_area.code("\n".join(logs[-15:]), language="")
 
         try:
-            with st.spinner("Processing..."):
+            # Progress bar elements — keep screen alive during long processing
+            st.markdown("**Processing Phases:**")
+            phase_status = st.empty()
+            progress_bar = st.progress(0)
+            row_counter  = st.empty()
 
-                # Load data
-                log_fn("Loading data...")
-                file_bytes = BytesIO(uploaded_file.read())
+            phases = ["Phase 1A","Phase 2A","Phase 1B","Phase 2B","Phase 3","Phase 4","Output"]
 
-                gstr2b_df = pd.read_excel(file_bytes, sheet_name="2B")
-                file_bytes.seek(0)
-                pr_df     = pd.read_excel(file_bytes, sheet_name="PR")
+            def update_phase_display(current_phase):
+                phase_status.markdown(
+                    "  ".join(
+                        f"✅ **{p}**" if phases.index(p) < phases.index(current_phase)
+                        else f"🔄 **{p}**" if p == current_phase
+                        else f"⬜ {p}"
+                        for p in phases
+                    )
+                )
 
-                gstr2b = engine.load_and_prepare(gstr2b_df, None, engine.GSTR2B_COLUMN_MAP, "GSTR 2B",   log_fn=log_fn)
-                pr     = engine.load_and_prepare(pr_df,     None, engine.PR_COLUMN_MAP,     "Purchase Register", log_fn=log_fn)
+            def progress_fn(label, done, total):
+                """Called every 50 rows — keeps Streamlit screen alive."""
+                pct = int((done / total) * 100) if total > 0 else 0
+                update_phase_display(label)
+                progress_bar.progress(min(pct, 99))
+                row_counter.caption(
+                    f"**{label}** — Row {done:,} of {total:,}  ({pct}%)"
+                )
 
-                log_fn(f"\nRunning reconciliation on {len(gstr2b)} 2B records and {len(pr)} PR records...")
-                t0 = time.time()
+            def on_log(msg):
+                log_fn(msg)
+                for ph in phases:
+                    if ph in msg:
+                        update_phase_display(ph)
+                        break
 
-                gstr2b, pr = engine.run_reconciliation(gstr2b, pr, cfg, log_fn=log_fn)
+            # Load data
+            log_fn("Loading data...")
+            file_bytes = BytesIO(uploaded_file.read())
+            gstr2b_df  = pd.read_excel(file_bytes, sheet_name="2B")
+            file_bytes.seek(0)
+            pr_df      = pd.read_excel(file_bytes, sheet_name="PR")
 
-                elapsed = time.time() - t0
-                log_fn(f"\n✅ Done in {elapsed:.1f} seconds.")
+            gstr2b = engine.load_and_prepare(gstr2b_df, None, engine.GSTR2B_COLUMN_MAP, "GSTR 2B",         log_fn=log_fn)
+            pr     = engine.load_and_prepare(pr_df,     None, engine.PR_COLUMN_MAP,     "Purchase Register", log_fn=log_fn)
 
-                # Build output
-                output_bytes = engine.build_output(gstr2b, pr, output_path=None, log_fn=log_fn)
-                summary_rows = engine.get_summary_dict(gstr2b, pr)
+            log_fn(f"\nRunning on {len(gstr2b):,} 2B records and {len(pr):,} PR records...")
+            t0 = time.time()
 
-            # Clear log area after done
+            gstr2b, pr = engine.run_reconciliation(
+                gstr2b, pr, cfg,
+                log_fn=on_log,
+                progress_fn=progress_fn
+            )
+
+            elapsed = time.time() - t0
+
+            # Build output
+            on_log("\nGenerating output...")
+            update_phase_display("Output")
+            progress_bar.progress(99)
+            output_bytes = engine.build_output(gstr2b, pr, output_path=None, log_fn=on_log)
+            summary_rows = engine.get_summary_dict(gstr2b, pr)
+
+            # All done — clear progress elements
+            progress_bar.progress(100)
+            phase_status.empty()
+            row_counter.empty()
             log_area.empty()
 
             st.success(f"✅ Reconciliation complete in **{elapsed:.1f} seconds**!")
