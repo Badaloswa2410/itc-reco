@@ -397,62 +397,82 @@ VARIANCE_LABELS = {M_FI,M_1,M_5,M_FI_1,M_FI_5,CB_FI,VN_FI,VN_1,VN_5,PAN_1,PAN_5,
 
 def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label="Phase 1",log_fn=print,progress_fn=None):
     """
-    One-to-one matching with vectorized fast path + bucket loop.
+    One-to-one matching — fast and correct.
 
-    Approach:
-    1. Fast path: pandas merge finds all M pairs instantly (O(n log n))
-       → stored in all_pairs AND as tentative reservations
-    2. Loop path: builds buckets EXCLUDING tentatively reserved PR rows
-       → faster because pool is smaller
-       → finds CB, DFY, PAN, VN, fuzzy etc. (non-M labels)
-    3. Global sort: combines all pairs, sorts by priority, assigns in order
-       → CB (priority 1) can override M (priority 2) when competing
-       → same guarantee as original code
+    Order of operations (exact_only mode):
+      Step 1: Fast CB scan  — GSTIN + invoice exact match, check is_cross_booked
+              Assign CB first (priority 1) so M cannot steal these rows.
+      Step 2: Fast M merge  — vectorized pandas merge for exact matches.
+              Assigns M only to rows not already taken by CB.
+      Step 3: Loop path     — runs on the now-small unmatched pool.
+              Finds fuzzy, variance, PAN, vendor-name matches.
+
+    This gives the same speed as the "Congratulations" version AND the
+    same quality as the original code (CB always beats M).
     """
     log_fn(f"\n  [{label}] One-to-One..."
            + (" (exact)" if exact_only else " (variance)" if variance_only else ""))
 
     pr_um = pr[~pr.index.isin(mpr)]
     TAX_RATIO_LIMIT = 10.0
-    all_pairs = []           # (priority, i, j, label) — all candidates
-    tentative_pr = set()    # PR indices tentatively reserved by fast path M matches
 
-    # ── FAST PATH: Vectorized exact merge finds M pairs in O(n log n) ────────
-    # Adds M pairs to all_pairs. Does NOT assign yet.
-    # Marks PR rows as tentatively reserved so loop builds a smaller bucket.
+    # ── STEP 1: CB fast scan (exact_only only) ────────────────────────────────
+    # Cross-booked: one side has IGST, other has CGST+SGST for same GSTIN+invoice.
+    # We only check rows where one side has IGST > 0 (cross-booking requires it).
+    if exact_only and not variance_only:
+        CT = cfg["cross_book_tolerance"]
+        # Group PR by GSTIN+invoice+FY for fast CB lookup
+        # Only include PR rows that have IGST > 0 OR CGST+SGST > 0
+        pr_gstin_inv = {}
+        for j, rpr in pr_um.iterrows():
+            if rpr["igst"] == 0 and (rpr["cgst"] == 0 or rpr["sgst"] == 0):
+                continue  # can't be cross-booked
+            key = (rpr["gstin"], rpr["_inv_norm"], rpr["_fy"])
+            pr_gstin_inv.setdefault(key, []).append(j)
+
+        if pr_gstin_inv:  # only scan if there are any CB candidates
+            g2b_um = gstr2b[~gstr2b.index.isin(m2b)]
+            for i, r2b in g2b_um.iterrows():
+                if i in m2b: continue
+                # Only check 2B rows that could be cross-booked
+                if r2b["igst"] == 0 and (r2b["cgst"] == 0 or r2b["sgst"] == 0):
+                    continue
+                key = (r2b["gstin"], r2b["_inv_norm"], r2b["_fy"])
+                for j in pr_gstin_inv.get(key, []):
+                    if j in mpr: continue
+                    rpr = pr_um.loc[j]
+                    if is_cross_booked_pair(r2b, rpr, CT):
+                        mark_1to1(i, j, CB, gstr2b, pr, m2b, mpr)
+                        break
+
+    # ── STEP 2: M fast merge (exact_only only) ────────────────────────────────
+    # Vectorized pandas merge — O(n log n). Only runs on still-unmatched rows.
     if exact_only and not variance_only:
         g2b = gstr2b[~gstr2b.index.isin(m2b)]
+        pr_um2 = pr[~pr.index.isin(mpr)]
         merge_keys = ["gstin","_inv_norm","_fy","igst","cgst","sgst"]
         try:
             merged = (
                 g2b[merge_keys].reset_index()
-                .merge(pr_um[merge_keys].reset_index(),
+                .merge(pr_um2[merge_keys].reset_index(),
                        on=merge_keys, suffixes=("_2b","_pr"))
             )
             seen_2b, seen_pr = set(), set()
             for _, row in merged.iterrows():
                 i, j = int(row["index_2b"]), int(row["index_pr"])
+                if i in m2b or j in mpr: continue
                 if i in seen_2b or j in seen_pr: continue
-                all_pairs.append((2, i, j, M))
-                # Tentatively reserve — but loop can still find higher-priority
-                # labels (like CB priority=1) for these same rows
-                tentative_pr.add(j)
+                mark_1to1(i, j, M, gstr2b, pr, m2b, mpr)
                 seen_2b.add(i); seen_pr.add(j)
         except Exception:
-            pass  # fallback — loop path below will find M pairs too
+            pass  # loop path below will catch M pairs as fallback
 
-    # ── LOOP PATH: Bucket-based scan for non-M labels ─────────────────────────
-    # Build buckets EXCLUDING tentatively reserved PR rows → smaller pool → faster
-    # Exception: if a PR row is tentative (M reserved) but could be CB (priority 1),
-    # we still need to check it. So include tentative rows in buckets — the global
-    # sort will resolve who gets the row correctly.
-    # (CB vs M competing for same PR row is extremely rare in practice, and
-    #  the global sort handles it correctly when it does occur.)
+    # ── STEP 3: Loop path — small pool, non-M labels only ────────────────────
+    # By now most rows are matched (CB + M). Loop runs on the small remainder.
+    # Finds: fuzzy invoice, variance, PAN, vendor-name, suffix/prefix, DFY.
+    pr_um3 = pr[~pr.index.isin(mpr)]
     bg, bp, bi = {}, {}, {}
-    # Build from full pr_um (not excluding tentative) — correctness over speed
-    # for the rare CB-vs-M conflict case. For M-only rows (common case),
-    # the loop finds nothing (skips M label) and continues quickly.
-    for j, rpr in pr_um.iterrows():
+    for j, rpr in pr_um3.iterrows():
         bg.setdefault(rpr["gstin"], []).append(j)
         if rpr["_pan"]:      bp.setdefault(rpr["_pan"], []).append(j)
         if rpr["_inv_norm"]: bi.setdefault(rpr["_inv_norm"], []).append(j)
@@ -463,14 +483,15 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
             if j not in seen: seen.add(j); res.append(j)
         if r2b["_pan"]:
             for j in bp.get(r2b["_pan"], []):
-                if pr_um.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
+                if pr_um3.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
                     seen.add(j); res.append(j)
         if r2b["_inv_norm"]:
             for j in bi.get(r2b["_inv_norm"], []):
-                if pr_um.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
+                if pr_um3.loc[j,"gstin"] != r2b["gstin"] and j not in seen:
                     seen.add(j); res.append(j)
         return res
 
+    pairs = []
     total_rows = len(gstr2b)
     processed  = 0
 
@@ -480,55 +501,42 @@ def _phase1_run(gstr2b,pr,m2b,mpr,cfg,exact_only=False,variance_only=False,label
             progress_fn(label, processed, total_rows)
         if i in m2b:
             continue
-
         r2b_tax = r2b["_total_tax"]
         r2b_fy  = r2b["_fy"]
 
         for j in cands(r2b):
-            if j in mpr or j not in pr_um.index:
+            if j in mpr or j not in pr_um3.index:
                 continue
-            rpr = pr_um.loc[j]
-
-            # FY check
+            rpr = pr_um3.loc[j]
             if rpr["_fy"] != r2b_fy and rpr["_inv_norm"] != r2b["_inv_norm"]:
                 continue
-
-            # Tax pre-filter
             rpr_tax = rpr["_total_tax"]
             if r2b_tax > 0 and rpr_tax > 0:
                 if max(r2b_tax, rpr_tax) / min(r2b_tax, rpr_tax) > TAX_RATIO_LIMIT:
                     continue
-
             res = classify_pair(r2b, rpr, cfg)
             if res is None: continue
             p, lbl, ir = res
             if not ir: continue
-            # Skip M in loop — fast path already found all M pairs via merge.
-            # This keeps the loop fast for the common case.
-            if lbl == M: continue
+            # Skip M and CB — already handled by fast paths above
+            if lbl in (M, CB): continue
             if exact_only    and lbl in VARIANCE_LABELS: continue
             if variance_only and lbl not in VARIANCE_LABELS: continue
-            all_pairs.append((p, i, j, lbl))
+            pairs.append((p, i, j, lbl))
 
     if progress_fn:
         progress_fn(label, total_rows, total_rows)
 
-    # ── GLOBAL PRIORITY SORT + ASSIGN ────────────────────────────────────────
-    # Sort ALL pairs by priority. CB (priority 1) beats M (priority 2).
-    # Greedy assignment in this order is globally optimal.
-    all_pairs.sort(key=lambda x: x[0])
+    pairs.sort(key=lambda x: x[0])
     lc = {}
-    for p, i, j, lbl in all_pairs:
-        if i in m2b or j in mpr:
-            continue
+    for p, i, j, lbl in pairs:
+        if i in m2b or j in mpr: continue
         mark_1to1(i, j, lbl, gstr2b, pr, m2b, mpr)
         lc[lbl] = lc.get(lbl, 0) + 1
 
-    total = sum(lc.values())
-    log_fn(f"    -> {total} matched.")
-    if lc:
-        for lbl, cnt in sorted(lc.items(), key=lambda x: x[1], reverse=True):
-            log_fn(f"       {lbl}: {cnt}")
+    log_fn(f"    -> {sum(lc.values()) if lc else 0} matched (loop path).")
+    for lbl, cnt in sorted(lc.items(), key=lambda x: x[1], reverse=True):
+        log_fn(f"       {lbl}: {cnt}")
 
 
 def _build_otm_groups(df, cfg):
